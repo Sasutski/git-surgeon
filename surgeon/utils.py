@@ -1,0 +1,1 @@
+# Shared helpers (e.g., log parsing, validation)
