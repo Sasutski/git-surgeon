@@ -1,4 +1,8 @@
-# intent catalog + schemas
+"""
+Intent catalog and parameter schemas for git-surgeon.
+Defines supported Git operations and their expected parameters for parsing and validation.
+"""
+
 
 from enum import Enum
 
