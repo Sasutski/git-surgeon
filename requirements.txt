@@ -1,1 +1,6 @@
 rapidfuzz
+pandas
+joblib
+scikit-learn
+matplotlib
+seaborn
