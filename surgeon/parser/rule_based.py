@@ -1,3 +1,5 @@
+#FALLBACK DO NOT USE
+# Rule-based intent parser for natural language commands
 # Natural language → intent parser
 import re
 from rapidfuzz import process, fuzz
