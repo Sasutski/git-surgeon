@@ -983,18 +983,30 @@ class IntentClassifier:
         # Extract parameters based on intent
         if intent_name == "DROP":
             # Message-based identification - handle first as special case
-            msg_match = re.search(r'(with\s+message|message\s+is|says)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
+            msg_match = re.search(r'(with\s+message|message\s+is|says|containing)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
             if not msg_match:
-                msg_match = re.search(r'(with\s+message|message\s+is|says)\s*"([^"]+)"', normalized_text, re.IGNORECASE)
+                msg_match = re.search(r'(with\s+message|message\s+is|says|containing)\s*"([^"]+)"', normalized_text, re.IGNORECASE)
+            
+            # For DROP intent, we need to be more careful with quoted text
+            # Only use general quoted text if it clearly looks like a commit message reference
+            # and not some other parameter
             if not msg_match:
-                # Try to find any quoted text that might be a message
-                msg_match = re.search(r'[\'"](.*?)[\'"]', normalized_text)
+                raw_quotes = re.search(r'[\'"](.*?)[\'"]', normalized_text)
+                if raw_quotes and ('commit' in normalized_text):
+                    # Check if the quote appears to be a message reference
+                    # rather than some other parameter
+                    quoted_text = raw_quotes.group(1)
+                    before_quote = normalized_text[:raw_quotes.start()].strip()
+                    if ('delete' in before_quote or 'drop' in before_quote or 'remove' in before_quote) and \
+                       not any(kw in before_quote for kw in ['to', 'as', 'with name', 'message as']):
+                        msg_match = raw_quotes
             
             if msg_match:
                 # Store as message_match parameter rather than embedding in target
                 message = msg_match.group(2) if len(msg_match.groups()) > 1 else msg_match.group(1)
                 params["message_match"] = message
-                # No early return here - we continue parsing to look for target
+                # Search in a larger history window for message matching
+                params["target"] = "HEAD~50..HEAD"
                 
             # First handle the "delete the latest commit" case
             if re.search(r'(delete|remove|drop|discard).+(latest|most\s+recent)', normalized_text, re.IGNORECASE):
@@ -1556,6 +1568,21 @@ if __name__ == "__main__":
                 # Extract and print parameters if available
                 if intent.upper() != "UNKNOWN":
                     params = classifier.extract_intent_parameters(user_input)
+                    
+                    # Ensure we don't have incorrect parameters
+                    # Filter parameters based on the intent schema
+                    schema = INTENT_SCHEMAS.get(intent_enum, {})
+                    allowed_params = []
+                    
+                    if isinstance(schema.get("params"), dict):
+                        # New schema format
+                        allowed_params = list(schema.get("params", {}).keys())
+                    else:
+                        # Old schema format
+                        allowed_params = schema.get("params", [])
+                    
+                    # Filter out any parameters not in the schema
+                    params = {k: v for k, v in params.items() if k in allowed_params}
                     
                     # Double-check DROP intent with special patterns (extra failsafe)
                     if intent.upper() == "DROP" and "target" not in params and "message_match" not in params:
