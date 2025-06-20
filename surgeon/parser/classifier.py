@@ -13,7 +13,8 @@ import numpy as np
 from typing import Tuple, Optional, Dict, Any, List
 import re
 from difflib import SequenceMatcher
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
+import time
 
 # Add the project root directory to the Python path if needed
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -48,14 +49,18 @@ class IntentClassifier:
         'DROP': [
             r'(drop|delet|remov).+(commit|commits)',
             r'get rid of.+commit',
-            r'(discard|eliminate).+commit',
-            r'(clear|purge).+commit',
-            r'(erased|remov).+commit',
+            r'(discard|eliminate).+(commit|commits)',
+            r'(clear|purge).+(commit|commits)',
+            r'(erased|remov).+(commit|commits)',
+            # Add patterns that more clearly distinguish DROP from REORDER
+            r'(delet|remov|drop).+\d+.+(commit|commits)',
+            r'(delet|remov|drop).+(last|previous|recent).+\d*.+(commit|commits)',
         ],
         'REORDER': [
             r'(reorder|chang.+order|swap|rearrang).+(commit|commits)',
-            r'(mov|switch).+commit',
+            r'(mov|switch).+commit.+(befor|after)',
             r'(revers|chang).+sequence',
+            r'(rearrang|reposition).+(commit|order)',
         ],
         'SPLIT': [
             r'(split|break|divid|separat).+(commit|commits)',
@@ -82,6 +87,41 @@ class IntentClassifier:
             r'(mov|transplant|replay).+(commit|chang).+(onto|on top of)',
             r'rebas.+(branch|commit)'
         ]
+    }
+    
+    # Action-target pattern matching for more accurate intent classification
+    # Maps specific action words to likely intents for stronger disambiguation
+    ACTION_INTENT_MAP = {
+        # Strong DROP indicators
+        'delete': 'DROP',
+        'remove': 'DROP', 
+        'eliminate': 'DROP',
+        'discard': 'DROP',
+        'drop': 'DROP',
+        
+        # Strong SQUASH indicators
+        'squash': 'SQUASH',
+        'combine': 'SQUASH',
+        'merge': 'SQUASH',
+        'join': 'SQUASH',
+        'flatten': 'SQUASH',
+        
+        # Strong REWORD indicators
+        'change message': 'REWORD',
+        'edit message': 'REWORD',
+        'reword': 'REWORD',
+        'rename message': 'REWORD',
+        'update message': 'REWORD',
+        
+        # Strong REORDER indicators
+        'reorder': 'REORDER',
+        'swap': 'REORDER',
+        'rearrange': 'REORDER',
+        'move': 'REORDER',
+        
+        # Strong RENAME_BRANCH indicators
+        'rename branch': 'RENAME_BRANCH',
+        'change branch name': 'RENAME_BRANCH',
     }
     
     # Common git and relevant domain words for noise detection
@@ -130,6 +170,10 @@ class IntentClassifier:
     FUZZY_SHORT_THRESHOLD = 0.85  # Higher similarity required for short words
     FUZZY_NORMAL_THRESHOLD = 0.78  # Normal threshold for longer words
     
+    # Caching configuration
+    MAX_CACHE_SIZE = 100  # Maximum number of entries in cache
+    CACHE_EXPIRY_SECONDS = 3600  # Cache entries expire after 1 hour
+    
     def __init__(self, model_path: str = None):
         """
         Initialize the classifier with a trained model.
@@ -137,6 +181,10 @@ class IntentClassifier:
         Args:
             model_path: Path to the saved model file. If None, uses the default path.
         """
+        # Initialize prediction cache
+        self._prediction_cache = OrderedDict()
+        self._normalized_text_cache = OrderedDict()
+        
         if model_path is None:
             # Default to the models directory relative to project root
             model_path = os.path.join(project_root, "models", "intent_classifier.pkl")
@@ -179,6 +227,14 @@ class IntentClassifier:
         self.domain_words_by_length = defaultdict(list)
         for word in self.DOMAIN_WORDS:
             self.domain_words_by_length[len(word)].append(word)
+
+        # Pre-compile action patterns for faster matching
+        self.action_patterns = {}
+        for action, intent in self.ACTION_INTENT_MAP.items():
+            # Create regex pattern for each action
+            # Using word boundary to ensure we match whole words/phrases
+            pattern = r'\b' + action.replace(' ', r'\s+') + r'\b'
+            self.action_patterns[re.compile(pattern, re.IGNORECASE)] = intent
 
     def _get_required_features(self) -> List[str]:
         """
@@ -269,6 +325,15 @@ class IntentClassifier:
         if not text:
             return ""
             
+        # Check cache first
+        cache_key = text.lower().strip()
+        if cache_key in self._normalized_text_cache:
+            # Move to end to mark as recently used
+            normalized = self._normalized_text_cache.pop(cache_key)
+            self._normalized_text_cache[cache_key] = normalized
+            return normalized
+            
+        # Process text if not in cache
         text_lower = text.lower()
         
         # Extract whole words for comparison
@@ -307,6 +372,14 @@ class IntentClassifier:
             # Sort by length descending to avoid partial word replacements
             for word, correction in sorted(replacements.items(), key=lambda x: len(x[0]), reverse=True):
                 text_lower = re.sub(r'\b' + re.escape(word) + r'\b', correction, text_lower)
+        
+        # Add result to cache
+        self._normalized_text_cache[cache_key] = text_lower
+        
+        # Maintain cache size limit
+        if len(self._normalized_text_cache) > self.MAX_CACHE_SIZE:
+            # Remove oldest entry (first item in OrderedDict)
+            self._normalized_text_cache.popitem(last=False)
         
         return text_lower
 
@@ -366,6 +439,42 @@ class IntentClassifier:
             
         return df
 
+    def _detect_primary_action(self, text: str) -> Tuple[str, float]:
+        """
+        Detect the primary action in the text to help disambiguate between similar intents.
+        This serves as an additional signal beyond the ML model's prediction.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            Tuple of (intent_name, confidence_boost)
+        """
+        text_lower = text.lower()
+        
+        # Check for direct action matches
+        for pattern, intent in self.action_patterns.items():
+            if pattern.search(text_lower):
+                return intent, 0.3  # Strong confidence boost for direct action match
+        
+        # Check for numeric patterns that indicate specific intents
+        number_commits_pattern = re.search(r'(last|previous|recent)\s+(\d+)\s+(commit|commits)', text_lower)
+        if number_commits_pattern:
+            # "last X commits" is common for many operations, check for specific actions
+            if any(term in text_lower for term in ['delete', 'remove', 'drop']):
+                return 'DROP', 0.35
+            elif any(term in text_lower for term in ['squash', 'combine', 'merge']):
+                return 'SQUASH', 0.35
+            # Default to a weaker signal if just "last X commits" with no clear action
+            return '', 0.0
+            
+        # Check for commit modification patterns
+        if ('message' in text_lower and any(term in text_lower for term in ['change', 'edit', 'update'])):
+            return 'REWORD', 0.25
+            
+        # No clear primary action detected
+        return '', 0.0
+
     def _boost_confidence(self, text: str, intent: str, base_confidence: float) -> float:
         """
         Boost confidence for predictions based on pattern matching.
@@ -385,6 +494,19 @@ class IntentClassifier:
         # Normalize text to handle typos
         normalized_text = self._normalize_text(text)
         
+        # Check for primary action that might override ML prediction
+        detected_intent, action_boost = self._detect_primary_action(normalized_text)
+        
+        # If we detected a strong action signal and it matches the predicted intent,
+        # apply a significant confidence boost
+        if detected_intent and detected_intent == intent:
+            return min(base_confidence + action_boost, 0.98)
+            
+        # If we detected a strong action signal but it DOESN'T match the predicted intent,
+        # this is a red flag - reduce confidence slightly unless it's very high
+        if detected_intent and detected_intent != intent and base_confidence < 0.85:
+            return max(base_confidence - 0.05, 0.0)
+        
         # Check if text matches any regex patterns for this intent
         if intent in self.intent_regexes:
             for pattern in self.intent_regexes[intent]:
@@ -394,7 +516,7 @@ class IntentClassifier:
                     # Don't let confidence exceed 0.98
                     return min(base_confidence + boost_factor, 0.98)
         
-        # Additional confidence boosts for specific intents
+        # Additional intent-specific confidence boosts
         if intent == 'SQUASH':
             # Key pattern: 'merge/combine/squash' + number + 'commits'
             if re.search(r'(merge|combin|squash|join).+\d+.*(commit|commits)', normalized_text):
@@ -408,6 +530,15 @@ class IntentClassifier:
             if any(kw in normalized_text for kw in ['squash', 'combine', 'merge']):
                 return min(base_confidence + 0.12, 0.98)
                 
+        elif intent == 'DROP':
+            # Key pattern: 'delete/remove/drop' + number + 'commits'
+            if re.search(r'(delet|remov|drop).+\d+.*(commit|commits)', normalized_text):
+                return min(base_confidence + 0.40, 0.98)
+                
+            # Another strong pattern: delete/remove/drop + last/recent/previous + commits
+            if re.search(r'(delet|remov|drop).+(last|recent|previous).*(commit|commits)', normalized_text):
+                return min(base_confidence + 0.40, 0.98)
+                
         elif intent == 'REWORD':
             if any(kw in normalized_text for kw in ['message', 'commit message']):
                 return min(base_confidence + 0.12, 0.98)
@@ -418,6 +549,544 @@ class IntentClassifier:
             
         # No boost applied
         return base_confidence
+
+    def clear_cache(self):
+        """
+        Clear all prediction caches. Use when memory usage is a concern
+        or when updating the model.
+        """
+        self._prediction_cache.clear()
+        self._normalized_text_cache.clear()
+    
+    def predict(self, text: str) -> str:
+        """
+        Predict the raw string label of the intent.
+        
+        Args:
+            text: The natural language input text
+            
+        Returns:
+            The predicted intent label as a string
+        """
+        # Check cache first
+        cache_key = text.lower().strip()
+        if cache_key in self._prediction_cache:
+            cache_entry = self._prediction_cache.pop(cache_key)  # Remove and re-add to update LRU order
+            # Check if the cache entry has expired
+            if time.time() - cache_entry['timestamp'] <= self.CACHE_EXPIRY_SECONDS:
+                # Move to end to mark as recently used
+                self._prediction_cache[cache_key] = cache_entry
+                return cache_entry['prediction']
+        
+        # Apply typo correction for prediction
+        normalized_text = self._normalize_text(text)
+        
+        # Check for noise/random input
+        if self._is_likely_noise(text):
+            # Store in cache
+            self._prediction_cache[cache_key] = {
+                'prediction': "UNKNOWN", 
+                'timestamp': time.time()
+            }
+            # Maintain cache size limit
+            if len(self._prediction_cache) > self.MAX_CACHE_SIZE:
+                self._prediction_cache.popitem(last=False)  # Remove oldest
+            return "UNKNOWN"
+            
+        X = self._prepare_features(normalized_text)
+        
+        # Make prediction
+        try:
+            prediction = self.model.predict(X)[0]
+            
+            # Convert prediction to string if it's not already
+            if isinstance(prediction, (np.ndarray, np.int64, np.integer, int)):
+                # If we have a label encoder, use it to get the original label
+                if hasattr(self, 'label_encoder') and self.label_encoder is not None:
+                    prediction = self.label_encoder.inverse_transform([prediction])[0]
+                else:
+                    prediction = str(prediction)
+            
+            # Store in cache
+            self._prediction_cache[cache_key] = {
+                'prediction': prediction, 
+                'timestamp': time.time()
+            }
+            
+            # Maintain cache size limit
+            if len(self._prediction_cache) > self.MAX_CACHE_SIZE:
+                self._prediction_cache.popitem(last=False)  # Remove oldest
+                
+            return prediction
+        except Exception as e:
+            raise ValueError(f"Error predicting intent: {str(e)}")
+
+    def predict_enum(self, text: str) -> Intent:
+        """
+        Predict the intent and return it as an Intent enum.
+        
+        Args:
+            text: The natural language input text
+            
+        Returns:
+            The predicted intent as an Intent enum
+        """
+        label = self.predict(text)
+        
+        # Ensure label is a string before calling upper()
+        if not isinstance(label, str):
+            label = str(label)
+            
+        try:
+            return Intent[label.upper()]
+        except KeyError:
+            # Handle unknown intents more gracefully
+            if label.upper() == "UNKNOWN":
+                # If we have UNKNOWN intent defined, use it
+                if hasattr(Intent, "UNKNOWN"):
+                    return Intent.UNKNOWN
+                else:
+                    # Otherwise, use a default intent
+                    return Intent.DROP  # Replace with appropriate fallback
+            raise ValueError(f"Unknown intent label: {label}")
+    
+    def predict_with_confidence(self, text: str) -> Tuple[str, Optional[float]]:
+        """
+        Predict the intent with confidence score.
+        
+        Args:
+            text: The natural language input text
+            
+        Returns:
+            A tuple of (intent_label, confidence_score)
+        """
+        # Check cache first
+        cache_key = text.lower().strip()
+        if cache_key in self._prediction_cache:
+            cache_entry = self._prediction_cache.pop(cache_key)
+            # Check if the cache entry has confidence and hasn't expired
+            if 'confidence' in cache_entry and time.time() - cache_entry['timestamp'] <= self.CACHE_EXPIRY_SECONDS:
+                # Move to end to mark as recently used
+                self._prediction_cache[cache_key] = cache_entry
+                return (cache_entry['prediction'], cache_entry['confidence'])
+        
+        # Apply typo correction for prediction
+        normalized_text = self._normalize_text(text)
+        
+        X = self._prepare_features(normalized_text)
+        
+        if not hasattr(self.model, 'predict_proba'):
+            # Fallback if model doesn't support probabilities
+            prediction = self.predict(text)  # Use the updated predict method
+            return (prediction, None)
+        
+        try:
+            # Check for noise first
+            is_noise = self._is_likely_noise(text)
+            
+            # Get probabilities for each class
+            probabilities = self.model.predict_proba(X)[0]
+            # Get the highest probability and its index
+            max_prob_idx = probabilities.argmax()
+            confidence = probabilities[max_prob_idx]
+            
+            # For likely noise, adjust confidence down
+            if is_noise:
+                confidence = self._adjust_confidence_for_noise(text, confidence)
+                
+            # Get the class label for the highest probability
+            if hasattr(self.model, 'classes_'):
+                label = self.model.classes_[max_prob_idx]
+                # Convert numeric label to original string label if needed
+                if hasattr(self, 'label_encoder') and self.label_encoder is not None and not isinstance(label, str):
+                    label = self.label_encoder.inverse_transform([label])[0]
+            else:
+                # Try to get the prediction directly
+                label = self.predict(text)
+                
+            # Check additional patterns to boost confidence
+            if isinstance(label, str) and not is_noise:
+                confidence = self._boost_confidence(text, label.upper(), confidence)
+            
+            # Return UNKNOWN if confidence is too low
+            if confidence < self.CONFIDENCE_THRESHOLD:
+                # Store in cache
+                self._prediction_cache[cache_key] = {
+                    'prediction': "UNKNOWN",
+                    'confidence': confidence,
+                    'timestamp': time.time()
+                }
+                # Maintain cache size
+                if len(self._prediction_cache) > self.MAX_CACHE_SIZE:
+                    self._prediction_cache.popitem(last=False)
+                return ("UNKNOWN", confidence)
+            
+            # Store in cache
+            self._prediction_cache[cache_key] = {
+                'prediction': label,
+                'confidence': confidence,
+                'timestamp': time.time()
+            }
+            
+            # Maintain cache size
+            if len(self._prediction_cache) > self.MAX_CACHE_SIZE:
+                self._prediction_cache.popitem(last=False)
+                
+            return (label, confidence)
+        except Exception as e:
+            raise ValueError(f"Error predicting intent with confidence: {str(e)}")
+            
+    def get_top_n_predictions(self, text: str, n: int = 3) -> List[Tuple[str, float]]:
+        """
+        Get the top N predictions with confidence scores.
+        
+        Args:
+            text: The natural language input text
+            n: Number of top predictions to return
+            
+        Returns:
+            List of (intent, confidence) tuples, sorted by confidence
+        """
+        # Check cache first
+        cache_key = f"{text.lower().strip()}:top{n}"
+        if cache_key in self._prediction_cache:
+            cache_entry = self._prediction_cache.pop(cache_key)
+            # Check if the cache entry has top_predictions and hasn't expired
+            if 'top_predictions' in cache_entry and time.time() - cache_entry['timestamp'] <= self.CACHE_EXPIRY_SECONDS:
+                # Move to end to mark as recently used
+                self._prediction_cache[cache_key] = cache_entry
+                return cache_entry['top_predictions']
+        
+        # Apply typo correction for prediction
+        normalized_text = self._normalize_text(text)
+        
+        # Check if input is likely noise
+        is_noise = self._is_likely_noise(text)
+        
+        # Prepare features
+        X = self._prepare_features(normalized_text)
+        
+        try:
+            # Get probabilities for all classes
+            probabilities = self.model.predict_proba(X)[0]
+            
+            # Get indices of top N probabilities
+            top_indices = np.argsort(probabilities)[::-1][:n]
+            
+            results = []
+            for idx in top_indices:
+                confidence = probabilities[idx]
+                if hasattr(self.model, 'classes_'):
+                    label = self.model.classes_[idx]
+                    # Convert numeric label to original string label if needed
+                    if hasattr(self, 'label_encoder') and self.label_encoder is not None and not isinstance(label, str):
+                        label = self.label_encoder.inverse_transform([label])[0]
+                        
+                    # Apply confidence adjustment for noise
+                    if is_noise:
+                        confidence = self._adjust_confidence_for_noise(text, confidence)
+                    # Otherwise apply confidence boosting for non-noise
+                    elif isinstance(label, str):
+                        confidence = self._boost_confidence(text, label.upper(), confidence)
+                        
+                    results.append((label, confidence))
+            
+            # If likely noise and confidence is low, prepend UNKNOWN
+            if is_noise and (not results or results[0][1] < self.CONFIDENCE_THRESHOLD):
+                # Insert UNKNOWN as first result
+                uncertain_conf = min(results[0][1] if results else 0.2, 0.22)
+                results = [("UNKNOWN", uncertain_conf)] + results[:min(len(results), n-1)]
+            
+            # Special handling for primary action detection - may override model's prediction
+            if not is_noise:
+                detected_intent, action_boost = self._detect_primary_action(normalized_text)
+                
+                # If we detected a strong action with high confidence
+                if detected_intent and action_boost >= 0.3:
+                    # Check if the detected intent is already in the results
+                    detected_idx = next((i for i, (label, _) in enumerate(results) 
+                                        if label.upper() == detected_intent), None)
+                    
+                    if detected_idx is not None:
+                        # It's already in results, boost confidence significantly
+                        label, conf = results[detected_idx]
+                        # Apply significant boost since this is based on explicit action terms
+                        new_conf = min(conf + action_boost, 0.98)
+                        results[detected_idx] = (label, new_conf)
+                        # Resort based on new confidences
+                        results.sort(key=lambda x: x[1], reverse=True)
+                    else:
+                        # Detected intent not in top results, but action signal is strong enough
+                        # to include it (only if confidence boost is high)
+                        if action_boost >= 0.35:
+                            # Add it to results
+                            results.append((detected_intent, 0.8))
+                            # Resort
+                            results.sort(key=lambda x: x[1], reverse=True)
+                            # Keep only top N
+                            results = results[:n]
+                
+                # Special case for "delete X commits" pattern - should strongly favor DROP over REORDER
+                if ("delete" in normalized_text or "remove" in normalized_text) and "commit" in normalized_text:
+                    # Check if both DROP and REORDER are in the results
+                    drop_idx = next((i for i, (label, _) in enumerate(results) if label == "DROP"), None)
+                    reorder_idx = next((i for i, (label, _) in enumerate(results) if label == "REORDER"), None)
+                    
+                    # If both are present, ensure DROP has higher confidence
+                    if drop_idx is not None and reorder_idx is not None:
+                        # Get current confidences
+                        _, drop_conf = results[drop_idx]
+                        _, reorder_conf = results[reorder_idx]
+                        
+                        # If REORDER has higher confidence than DROP, boost DROP
+                        if reorder_conf > drop_conf:
+                            # Boost DROP confidence to be higher than REORDER
+                            new_drop_conf = min(reorder_conf + 0.1, 0.98)
+                            results[drop_idx] = ("DROP", new_drop_conf)
+                            # Resort based on new confidences
+                            results.sort(key=lambda x: x[1], reverse=True)
+            
+            # Store results in cache
+            self._prediction_cache[cache_key] = {
+                'top_predictions': results,
+                'timestamp': time.time()
+            }
+            
+            # Maintain cache size
+            if len(self._prediction_cache) > self.MAX_CACHE_SIZE:
+                self._prediction_cache.popitem(last=False)
+                
+            return results
+        except Exception as e:
+            raise ValueError(f"Error getting top predictions: {str(e)}")
+
+    def extract_intent_parameters(self, text: str) -> Dict[str, Any]:
+        """
+        Extract parameters from the text based on predicted intent.
+        Uses the schema defined in intents.py to extract relevant parameters.
+        
+        Args:
+            text: The natural language input text
+            
+        Returns:
+            Dictionary of extracted parameters
+        """
+        # Apply typo correction before parameter extraction
+        normalized_text = self._normalize_text(text)
+        
+        # Get intent
+        try:
+            intent_enum = self.predict_enum(normalized_text)
+            intent_name = intent_enum.name
+        except ValueError:
+            # If we can't determine intent, return empty params
+            return {}
+        
+        params = {}
+        
+        # Get required parameters from schema
+        required_params = INTENT_SCHEMAS.get(intent_enum, {}).get("params", [])
+        
+        if intent_name == "SQUASH":
+            # Look for number of commits to squash
+            number_match = re.search(r'(\d+)(?:\s+commit)', normalized_text)
+            if not number_match:
+                # Try alternative pattern with plural "commits"
+                number_match = re.search(r'(\d+)(?:\s+commits)', normalized_text)
+                
+            if number_match:
+                params["count"] = int(number_match.group(1))
+                
+            # Look for last/recent X commits pattern
+            last_match = re.search(r'last\s+(\d+)', normalized_text)
+            if last_match:
+                params["count"] = int(last_match.group(1))
+            
+            # Look for most recent/last commit (singular)
+            if "last commit" in normalized_text or "most recent commit" in normalized_text:
+                if "count" not in params:
+                    params["count"] = 1
+                
+            # Look for commit message
+            msg_match = re.search(r'(message|name|msg|called|with)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
+            if not msg_match:
+                # Try with double quotes
+                msg_match = re.search(r'(message|name|msg|called|with)\s*"([^"]+)"', normalized_text, re.IGNORECASE)
+            if msg_match:
+                params["new_message"] = msg_match.group(2)
+        
+        elif intent_name == "REWORD":
+            # Look for target commit
+            target_match = re.search(r'(commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
+            if target_match:
+                params["target"] = target_match.group(2)
+                
+            # Check for "last" or "previous" commit
+            if "last commit" in normalized_text or "previous commit" in normalized_text or "most recent commit" in normalized_text:
+                params["target"] = "HEAD"
+                
+            # Look for commit message
+            msg_match = re.search(r'(to|with|as)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
+            if not msg_match:
+                msg_match = re.search(r'(message|name|msg|called|with)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
+            if not msg_match:
+                # Try with double quotes
+                msg_match = re.search(r'(message|name|msg|called|with)\s*"([^"]+)"', normalized_text, re.IGNORECASE)
+            if msg_match:
+                params["new_message"] = msg_match.group(2)
+        
+        elif intent_name == "DROP":
+            # Look for target commit hash
+            target_match = re.search(r'(commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
+            if target_match:
+                params["target"] = target_match.group(2)
+            
+            # Check for ordinal position references like "second last commit", "third last", etc.
+            ordinal_match = re.search(r'(second|third|fourth|fifth|2nd|3rd|4th|5th)\s+(last|previous|recent)\s+commit', normalized_text, re.IGNORECASE)
+            if ordinal_match:
+                # Map ordinals to their numeric values
+                ordinal_map = {
+                    'second': 1, '2nd': 1,
+                    'third': 2, '3rd': 2,
+                    'fourth': 3, '4th': 3,
+                    'fifth': 4, '5th': 4
+                }
+                ordinal = ordinal_match.group(1).lower()
+                # For "second last commit", we want HEAD~1, etc.
+                params["target"] = f"HEAD~{ordinal_map.get(ordinal, 1)}"
+                
+            # Check for "last" or "previous" commit (singular)
+            elif "last commit" in normalized_text or "previous commit" in normalized_text or "most recent commit" in normalized_text:
+                params["target"] = "HEAD"
+            
+            # Check for "last N commits" pattern 
+            last_n_match = re.search(r'(last|previous|recent)\s+(\d+)\s+(commit|commits)', normalized_text)
+            if last_n_match:
+                # For multi-commit operations, we need to specify a range
+                count = int(last_n_match.group(2))
+                if count > 1:  # For multiple commits
+                    # When deleting the last N commits, we need the range HEAD~(N-1)..HEAD
+                    params["target"] = f"HEAD~{count-1}..HEAD"
+                else:  # For single commit
+                    params["target"] = "HEAD"
+                    
+            # Direct number pattern - "delete N commits"
+            number_match = re.search(r'(?:delete|remove|drop)\s+(\d+)\s+(?:commit|commits)', normalized_text)
+            if number_match and "target" not in params:
+                count = int(number_match.group(1))
+                if count > 1:
+                    # Same as above, for N commits use HEAD~(N-1)..HEAD
+                    params["target"] = f"HEAD~{count-1}..HEAD"
+                else:
+                    params["target"] = "HEAD"
+                    
+            # Check for numbered commit without context (like "commit 3")
+            commit_num_match = re.search(r'commit\s+(\d+)', normalized_text)
+            if commit_num_match and "target" not in params:
+                commit_num = int(commit_num_match.group(1))
+                # For a specific numbered commit, we want HEAD~(N-1)
+                params["target"] = f"HEAD~{commit_num-1}"
+        
+        elif intent_name == "REORDER":
+            # Look for order specification
+            order_match = re.search(r'order\s*:\s*(.+?)(?:$|\.|;)', normalized_text)
+            if order_match:
+                order_text = order_match.group(1).strip()
+                # Split by commas if present
+                if ',' in order_text:
+                    params["order"] = [s.strip() for s in order_text.split(',')]
+                else:
+                    # Split by spaces
+                    params["order"] = order_text.split()
+            
+            # Look for "swap X and Y" pattern
+            swap_match = re.search(r'swap\s+(.+?)\s+and\s+(.+?)(?:$|\.|;)', normalized_text)
+            if swap_match:
+                params["order"] = [swap_match.group(1), swap_match.group(2)]
+        
+        elif intent_name == "SPLIT":
+            # Look for target commit
+            target_match = re.search(r'(commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
+            if target_match:
+                params["target"] = target_match.group(2)
+                
+            # Check for "last" or "previous" commit
+            if "last commit" in normalized_text or "previous commit" in normalized_text:
+                params["target"] = "HEAD"
+                
+            # Check for split strategy
+            if "by file" in normalized_text or "by files" in normalized_text:
+                params["split_strategy"] = "by_file"
+            elif "manually" in normalized_text or "manual" in normalized_text:
+                params["split_strategy"] = "manual"
+            else:
+                params["split_strategy"] = "default"
+        
+        elif intent_name == "AMEND":
+            # Check for files to add
+            file_match = re.findall(r'(add|with|include)\s+(?:file[s]?\s+)?[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
+            if file_match:
+                params["add_files"] = [match[1] for match in file_match]
+            
+            # Look for stage all
+            if "all changes" in normalized_text or "all files" in normalized_text or "everything" in normalized_text:
+                params["add_files"] = ["--all"]
+                
+            # Look for commit message
+            msg_match = re.search(r'(message|name|msg|called|with)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
+            if msg_match:
+                params["new_message"] = msg_match.group(2)
+        
+        elif intent_name == "UNDO":
+            # Look for target (number of commits to undo)
+            number_match = re.search(r'(\d+)(?:\s+commit)', normalized_text)
+            if number_match:
+                params["target"] = number_match.group(1)
+                
+            # Check for "last" or "previous" commit
+            if "last commit" in normalized_text or "previous commit" in normalized_text:
+                if "target" not in params:
+                    params["target"] = "HEAD"
+            
+            # Check for specific commit hash
+            target_match = re.search(r'(commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
+            if target_match:
+                params["target"] = target_match.group(2)
+        
+        elif intent_name == "RENAME_BRANCH":
+            # Look for new branch name
+            name_match = re.search(r'(?:to|as|name)\s+[\'"]?([a-zA-Z0-9_\-./]+)[\'"]?', normalized_text)
+            if name_match:
+                params["new_name"] = name_match.group(1)
+                
+            # Alternative pattern: "rename branch X to Y"
+            alt_match = re.search(r'(?:rename|change)\s+branch\s+[\'"]?([a-zA-Z0-9_\-./]+)[\'"]?\s+to\s+[\'"]?([a-zA-Z0-9_\-./]+)[\'"]?', normalized_text)
+            if alt_match:
+                params["current_name"] = alt_match.group(1)
+                params["new_name"] = alt_match.group(2)
+                
+        elif intent_name == "REBASE_ONTO":
+            # Look for base branch
+            base_match = re.search(r'(?:onto|on|to)\s+[\'"]?([a-zA-Z0-9_\-./]+)[\'"]?', normalized_text)
+            if base_match:
+                params["base_branch"] = base_match.group(1)
+                
+            # Look for commit range
+            range_match = re.search(r'(?:from|since)\s+([a-f0-9]{4,40})', normalized_text)
+            if range_match:
+                params["commit_range"] = range_match.group(1)
+                
+            # Look for "last N commits" pattern
+            last_n_match = re.search(r'(?:last|recent)\s+(\d+)\s+(?:commit|commits)', normalized_text)
+            if last_n_match:
+                params["commit_range"] = f"HEAD~{last_n_match.group(1)}"
+        
+        # Filter params to only include those in the schema
+        if required_params:
+            params = {k: v for k, v in params.items() if k in required_params}
+            
+        return params
+
 
     def _is_likely_noise(self, text: str) -> bool:
         """
@@ -482,248 +1151,6 @@ class IntentClassifier:
             # Significantly reduce confidence for likely noise
             return min(confidence, self.CONFIDENCE_THRESHOLD - 0.02)
         return confidence
-
-    def predict(self, text: str) -> str:
-        """
-        Predict the raw string label of the intent.
-        
-        Args:
-            text: The natural language input text
-            
-        Returns:
-            The predicted intent label as a string
-        """
-        # Apply typo correction for prediction
-        normalized_text = self._normalize_text(text)
-        
-        # Check for noise/random input
-        if self._is_likely_noise(text):
-            return "UNKNOWN"
-            
-        X = self._prepare_features(normalized_text)
-        
-        # Make prediction
-        try:
-            prediction = self.model.predict(X)[0]
-            
-            # Convert prediction to string if it's not already
-            if isinstance(prediction, (np.ndarray, np.int64, np.integer, int)):
-                # If we have a label encoder, use it to get the original label
-                if hasattr(self, 'label_encoder') and self.label_encoder is not None:
-                    prediction = self.label_encoder.inverse_transform([prediction])[0]
-                else:
-                    prediction = str(prediction)
-                
-            return prediction
-        except Exception as e:
-            raise ValueError(f"Error predicting intent: {str(e)}")
-
-    def predict_enum(self, text: str) -> Intent:
-        """
-        Predict the intent and return it as an Intent enum.
-        
-        Args:
-            text: The natural language input text
-            
-        Returns:
-            The predicted intent as an Intent enum
-        """
-        label = self.predict(text)
-        
-        # Ensure label is a string before calling upper()
-        if not isinstance(label, str):
-            label = str(label)
-            
-        try:
-            return Intent[label.upper()]
-        except KeyError:
-            # Handle unknown intents more gracefully
-            if label.upper() == "UNKNOWN":
-                # If we have UNKNOWN intent defined, use it
-                if hasattr(Intent, "UNKNOWN"):
-                    return Intent.UNKNOWN
-                else:
-                    # Otherwise, use a default intent
-                    return Intent.DROP  # Replace with appropriate fallback
-            raise ValueError(f"Unknown intent label: {label}")
-    
-    def predict_with_confidence(self, text: str) -> Tuple[str, Optional[float]]:
-        """
-        Predict the intent with confidence score.
-        
-        Args:
-            text: The natural language input text
-            
-        Returns:
-            A tuple of (intent_label, confidence_score)
-        """
-        # Apply typo correction for prediction
-        normalized_text = self._normalize_text(text)
-        
-        X = self._prepare_features(normalized_text)
-        
-        if not hasattr(self.model, 'predict_proba'):
-            # Fallback if model doesn't support probabilities
-            prediction = self.predict(text)  # Use the updated predict method
-            return (prediction, None)
-        
-        try:
-            # Check for noise first
-            is_noise = self._is_likely_noise(text)
-            
-            # Get probabilities for each class
-            probabilities = self.model.predict_proba(X)[0]
-            # Get the highest probability and its index
-            max_prob_idx = probabilities.argmax()
-            confidence = probabilities[max_prob_idx]
-            
-            # For likely noise, adjust confidence down
-            if is_noise:
-                confidence = self._adjust_confidence_for_noise(text, confidence)
-                
-            # Get the class label for the highest probability
-            if hasattr(self.model, 'classes_'):
-                label = self.model.classes_[max_prob_idx]
-                # Convert numeric label to original string label if needed
-                if hasattr(self, 'label_encoder') and self.label_encoder is not None and not isinstance(label, str):
-                    label = self.label_encoder.inverse_transform([label])[0]
-            else:
-                # Try to get the prediction directly
-                label = self.predict(text)
-                
-            # Check additional patterns to boost confidence
-            if isinstance(label, str) and not is_noise:
-                confidence = self._boost_confidence(text, label.upper(), confidence)
-            
-            # Return UNKNOWN if confidence is too low
-            if confidence < self.CONFIDENCE_THRESHOLD:
-                return ("UNKNOWN", confidence)
-                
-            return (label, confidence)
-        except Exception as e:
-            raise ValueError(f"Error predicting intent with confidence: {str(e)}")
-            
-    def get_top_n_predictions(self, text: str, n: int = 3) -> List[Tuple[str, float]]:
-        """
-        Get the top N predictions with confidence scores.
-        
-        Args:
-            text: The natural language input text
-            n: Number of top predictions to return
-            
-        Returns:
-            List of (intent, confidence) tuples, sorted by confidence
-        """
-        # Apply typo correction for prediction
-        normalized_text = self._normalize_text(text)
-        
-        X = self._prepare_features(normalized_text)
-        
-        if not hasattr(self.model, 'predict_proba'):
-            # Fallback if model doesn't support probabilities
-            prediction = self.predict(text)
-            return [(prediction, 1.0)]
-        
-        try:
-            # Check if input is likely noise
-            is_noise = self._is_likely_noise(text)
-            
-            # Get probabilities for all classes
-            probabilities = self.model.predict_proba(X)[0]
-            
-            # Get indices of top N probabilities
-            top_indices = np.argsort(probabilities)[::-1][:n]
-            
-            results = []
-            for idx in top_indices:
-                confidence = probabilities[idx]
-                if hasattr(self.model, 'classes_'):
-                    label = self.model.classes_[idx]
-                    # Convert numeric label to original string label if needed
-                    if hasattr(self, 'label_encoder') and self.label_encoder is not None and not isinstance(label, str):
-                        label = self.label_encoder.inverse_transform([label])[0]
-                        
-                    # Apply confidence adjustment for noise
-                    if is_noise:
-                        confidence = self._adjust_confidence_for_noise(text, confidence)
-                    # Otherwise apply confidence boosting for non-noise
-                    elif isinstance(label, str):
-                        confidence = self._boost_confidence(text, label.upper(), confidence)
-                        
-                    results.append((label, confidence))
-            
-            # If likely noise and confidence is low, prepend UNKNOWN
-            if is_noise and (not results or results[0][1] < self.CONFIDENCE_THRESHOLD):
-                # Insert UNKNOWN as first result
-                uncertain_conf = min(results[0][1] if results else 0.2, 0.22)
-                results = [("UNKNOWN", uncertain_conf)] + results[:min(len(results), n-1)]
-                
-            # Special handling for merge/squash commands with high confidence patterns
-            if not is_noise:
-                # Check for specific patterns that strongly indicate SQUASH intent
-                squash_pattern = re.search(r'(merge|combin|squash).+\d+.*(commit|commits)', normalized_text)
-                
-                # If we have a strong squash pattern and SQUASH isn't already the top prediction
-                if squash_pattern and (not results or results[0][0] != "SQUASH"):
-                    # Find if SQUASH is in results
-                    squash_idx = next((i for i, (label, _) in enumerate(results) if label == "SQUASH"), None)
-                    
-                    if squash_idx is not None:
-                        # Boost confidence significantly and move to front
-                        squash_label, squash_conf = results[squash_idx]
-                        results[squash_idx] = (squash_label, min(squash_conf + 0.4, 0.95))
-                        results.sort(key=lambda x: x[1], reverse=True)
-                    else:
-                        # Add SQUASH if not found
-                        results = [("SQUASH", 0.85)] + results[:min(len(results), n-1)]
-            
-            return results
-        except Exception as e:
-            raise ValueError(f"Error getting top predictions: {str(e)}")
-
-    def extract_intent_parameters(self, text: str) -> Dict[str, Any]:
-        """
-        Extract parameters from the text based on predicted intent.
-        
-        Args:
-            text: The natural language input text
-            
-        Returns:
-            Dictionary of extracted parameters
-        """
-        # Apply typo correction before parameter extraction
-        normalized_text = self._normalize_text(text)
-        
-        intent_enum = self.predict_enum(normalized_text)
-        intent_name = intent_enum.name
-        
-        params = {}
-        
-        # Extract numeric values
-        if intent_name == "SQUASH":
-            # Look for number of commits to squash
-            number_match = re.search(r'(\d+)(?:\s+commit)', normalized_text)
-            if not number_match:
-                # Try alternative pattern with plural "commits"
-                number_match = re.search(r'(\d+)(?:\s+commits)', normalized_text)
-                
-            if number_match:
-                params["count"] = int(number_match.group(1))
-                
-            # Look for last/recent X commits pattern
-            last_match = re.search(r'last\s+(\d+)', normalized_text)
-            if last_match:
-                params["count"] = int(last_match.group(1))
-                
-            # Look for commit message
-            msg_match = re.search(r'(message|name|msg|called|with)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
-            if msg_match:
-                params["new_message"] = msg_match.group(2)
-        
-        # Add extraction logic for other intents as needed
-        
-        return params
-
 
 def explain_prediction(classifier: IntentClassifier, text: str) -> Dict[str, Any]:
     """
@@ -846,6 +1273,18 @@ if __name__ == "__main__":
                     print(f"  {key}: {value}")
                 continue
                 
+            if user_input.lower() == 'cache':
+                stats = classifier.cache_stats()
+                print("\nCache Statistics:")
+                for key, value in stats.items():
+                    print(f"  {key}: {value}")
+                continue
+                
+            if user_input.lower() == 'clearcache':
+                classifier.clear_cache()
+                print("Cache cleared.")
+                continue
+                
             try:
                 # Normalize text for correction
                 normalized = classifier._normalize_text(user_input)
@@ -903,6 +1342,17 @@ if __name__ == "__main__":
                         print("Extracted parameters:")
                         for param, value in params.items():
                             print(f"  - {param}: {value}")
+                    
+                    # Show missing required parameters based on schema
+                    try:
+                        required_params = INTENT_SCHEMAS.get(intent_enum, {}).get("params", [])
+                        missing_params = [param for param in required_params if param not in params]
+                        if missing_params:
+                            print("Missing parameters that may be required:")
+                            for param in missing_params:
+                                print(f"  - {param}")
+                    except Exception:
+                        pass
                     
             except Exception as e:
                 print(f"Error classifying intent: {e}")
