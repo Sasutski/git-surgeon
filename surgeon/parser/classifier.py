@@ -760,9 +760,68 @@ class IntentClassifier:
         # Apply typo correction for prediction
         normalized_text = self._normalize_text(text)
         
-        # Check if input is likely noise
+        # First check for specific high-priority patterns that need special handling
+        # These are cases where we know with high certainty what the intent is
+        # and we don't want to rely on the ML model which might be confused
+        
+        # Definite DROP cases: when user clearly says to drop/delete/remove commits with a number
+        drop_pattern = re.search(r'(drop|delet|remov)\s+(?:the\s+)?(last|previous|recent)\s+(\d+)\s+(commit|commits)', normalized_text)
+        if drop_pattern:
+            # This is definitely a DROP intent with high confidence, don't even bother with the model
+            # Do regular prediction but then override the results
+            try:
+                # Do normal prediction first
+                results = self._get_model_predictions(normalized_text, text, n, is_noise=False)
+                
+                # Now override with DROP at high confidence
+                drop_confidence = 0.95  # Very high confidence
+                
+                # Find if DROP is already in the results
+                drop_idx = next((i for i, (label, _) in enumerate(results) if label == "DROP"), None)
+                
+                if drop_idx is not None:
+                    # Replace the existing DROP entry with our high confidence one
+                    results[drop_idx] = ("DROP", drop_confidence)
+                else:
+                    # Insert DROP at the beginning
+                    results.insert(0, ("DROP", drop_confidence))
+                    
+                # Resort results
+                results.sort(key=lambda x: x[1], reverse=True)
+                # Trim to top N
+                results = results[:n]
+                
+                # Cache and return results
+                self._prediction_cache[f"{text.lower().strip()}:top{n}"] = {
+                    'top_predictions': results,
+                    'timestamp': time.time()
+                }
+                
+                return results
+            except Exception as e:
+                # Fall through to normal prediction if this special case handling fails
+                pass
+        
+        # Is the input likely noise?
         is_noise = self._is_likely_noise(text)
         
+        # Use the regular prediction pipeline
+        return self._get_model_predictions(normalized_text, text, n, is_noise)
+    
+    def _get_model_predictions(self, normalized_text: str, original_text: str, n: int, is_noise: bool) -> List[Tuple[str, float]]:
+        """
+        Helper method to get predictions from the model.
+        This contains the core prediction logic extracted from get_top_n_predictions.
+        
+        Args:
+            normalized_text: The normalized text
+            original_text: The original user input
+            n: Number of predictions to return
+            is_noise: Whether the input is likely noise
+            
+        Returns:
+            List of (intent, confidence) tuples sorted by confidence
+        """
         # Prepare features
         X = self._prepare_features(normalized_text)
         
@@ -784,10 +843,10 @@ class IntentClassifier:
                         
                     # Apply confidence adjustment for noise
                     if is_noise:
-                        confidence = self._adjust_confidence_for_noise(text, confidence)
+                        confidence = self._adjust_confidence_for_noise(original_text, confidence)
                     # Otherwise apply confidence boosting for non-noise
                     elif isinstance(label, str):
-                        confidence = self._boost_confidence(text, label.upper(), confidence)
+                        confidence = self._boost_confidence(original_text, label.upper(), confidence)
                         
                     results.append((label, confidence))
             
@@ -826,36 +885,29 @@ class IntentClassifier:
                             # Keep only top N
                             results = results[:n]
                 
-                # Special case for "delete X commits" pattern - should strongly favor DROP over REORDER
-                if ("delete" in normalized_text or "remove" in normalized_text) and "commit" in normalized_text:
+                # Special case for "drop/delete X commits" pattern - should strongly favor DROP over REORDER
+                if re.search(r'(drop|delet|remov).+(\d+|last).+(commit|commits)', normalized_text):
                     # Check if both DROP and REORDER are in the results
                     drop_idx = next((i for i, (label, _) in enumerate(results) if label == "DROP"), None)
                     reorder_idx = next((i for i, (label, _) in enumerate(results) if label == "REORDER"), None)
                     
+                    # Ensure DROP has very high confidence
+                    if drop_idx is not None:
+                        # Boost DROP to very high confidence
+                        results[drop_idx] = ("DROP", 0.97)  # Nearly certain
+                        
                     # If both are present, ensure DROP has higher confidence
                     if drop_idx is not None and reorder_idx is not None:
-                        # Get current confidences
-                        _, drop_conf = results[drop_idx]
-                        _, reorder_conf = results[reorder_idx]
+                        # Resort to ensure DROP comes first
+                        results.sort(key=lambda x: x[1], reverse=True)
                         
-                        # If REORDER has higher confidence than DROP, boost DROP
-                        if reorder_conf > drop_conf:
-                            # Boost DROP confidence to be higher than REORDER
-                            new_drop_conf = min(reorder_conf + 0.1, 0.98)
-                            results[drop_idx] = ("DROP", new_drop_conf)
-                            # Resort based on new confidences
-                            results.sort(key=lambda x: x[1], reverse=True)
+                    # If only REORDER is present but text suggests DROP, add DROP
+                    elif drop_idx is None and reorder_idx is not None:
+                        results.insert(0, ("DROP", 0.95))  # Insert DROP at beginning with high confidence
+                        # Keep only top N
+                        results = results[:n]
             
-            # Store results in cache
-            self._prediction_cache[cache_key] = {
-                'top_predictions': results,
-                'timestamp': time.time()
-            }
-            
-            # Maintain cache size
-            if len(self._prediction_cache) > self.MAX_CACHE_SIZE:
-                self._prediction_cache.popitem(last=False)
-                
+            # Cache keys are now handled by the caller
             return results
         except Exception as e:
             raise ValueError(f"Error getting top predictions: {str(e)}")
@@ -887,7 +939,75 @@ class IntentClassifier:
         # Get required parameters from schema
         required_params = INTENT_SCHEMAS.get(intent_enum, {}).get("params", [])
         
-        if intent_name == "SQUASH":
+        if intent_name == "DROP":
+            # First check for "drop/delete the last X commits" pattern - most common case
+            last_n_match = re.search(r'(?:drop|delet|remov)\s+(?:the\s+)?(?:last|previous|recent)\s+(\d+)\s+(?:commit|commits)', normalized_text, re.IGNORECASE)
+            if last_n_match:
+                count = int(last_n_match.group(1))
+                if count > 1:
+                    params["target"] = f"HEAD~{count-1}..HEAD"
+                else:
+                    params["target"] = "HEAD"
+            
+            # If no match found, check for other patterns...
+            if "target" not in params:
+                # Look for target commit hash
+                target_match = re.search(r'(?:commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
+                if target_match:
+                    params["target"] = target_match.group(1)
+                
+                # Check for ordinal position references like "second last commit", "third last", etc.
+                ordinal_match = re.search(r'(second|third|fourth|fifth|2nd|3rd|4th|5th)\s+(?:last|previous|recent)\s+commit', normalized_text, re.IGNORECASE)
+                if ordinal_match:
+                    # Map ordinals to their numeric values
+                    ordinal_map = {
+                        'second': 1, '2nd': 1,
+                        'third': 2, '3rd': 2,
+                        'fourth': 3, '4th': 3,
+                        'fifth': 4, '5th': 4
+                    }
+                    ordinal = ordinal_match.group(1).lower()
+                    # For "second last commit", we want HEAD~1, etc.
+                    params["target"] = f"HEAD~{ordinal_map.get(ordinal, 1)}"
+                    
+                # Check for "last" or "previous" commit (singular)
+                elif re.search(r'last\s+commit|previous\s+commit|most\s+recent\s+commit', normalized_text):
+                    params["target"] = "HEAD"
+                
+                # Alternative pattern for "last N commits"
+                last_n_alt = re.search(r'(?:last|previous|recent)\s+(\d+)\s+(?:commit|commits)', normalized_text)
+                if last_n_alt:
+                    # For multi-commit operations, we need to specify a range
+                    count = int(last_n_alt.group(1))
+                    if count > 1:  # For multiple commits
+                        # When deleting the last N commits, we need the range HEAD~(N-1)..HEAD
+                        params["target"] = f"HEAD~{count-1}..HEAD"
+                    else:  # For single commit
+                        params["target"] = "HEAD"
+                        
+                # Direct number pattern - "delete N commits" without "last"
+                number_match = re.search(r'(?:delete|remove|drop)\s+(\d+)\s+(?:commit|commits)', normalized_text)
+                if number_match and "target" not in params:
+                    count = int(number_match.group(1))
+                    if count > 1:
+                        # Same as above, for N commits use HEAD~(N-1)..HEAD
+                        params["target"] = f"HEAD~{count-1}..HEAD"
+                    else:
+                        params["target"] = "HEAD"
+                        
+                # Check for numbered commit without context (like "commit 3")
+                commit_num_match = re.search(r'commit\s+(\d+)', normalized_text)
+                if commit_num_match and "target" not in params:
+                    commit_num = int(commit_num_match.group(1))
+                    # For a specific numbered commit, we want HEAD~(N-1)
+                    params["target"] = f"HEAD~{commit_num-1}"
+                    
+                # Handle "delete from X to Y" pattern
+                range_match = re.search(r'from\s+(\S+)\s+to\s+(\S+)', normalized_text)
+                if range_match:
+                    params["target"] = f"{range_match.group(1)}..{range_match.group(2)}"
+        
+        elif intent_name == "SQUASH":
             # Look for number of commits to squash
             number_match = re.search(r'(\d+)(?:\s+commit)', normalized_text)
             if not number_match:
@@ -898,9 +1018,9 @@ class IntentClassifier:
                 params["count"] = int(number_match.group(1))
                 
             # Look for last/recent X commits pattern
-            last_match = re.search(r'last\s+(\d+)', normalized_text)
+            last_match = re.search(r'(last|previous|recent)\s+(\d+)', normalized_text)
             if last_match:
-                params["count"] = int(last_match.group(1))
+                params["count"] = int(last_match.group(2))
             
             # Look for most recent/last commit (singular)
             if "last commit" in normalized_text or "most recent commit" in normalized_text:
@@ -912,8 +1032,12 @@ class IntentClassifier:
             if not msg_match:
                 # Try with double quotes
                 msg_match = re.search(r'(message|name|msg|called|with)\s*"([^"]+)"', normalized_text, re.IGNORECASE)
+            if not msg_match:
+                # Try more general pattern to capture message without specific keywords
+                msg_match = re.search(r'[\'"](.*?)[\'"]', normalized_text)
+                
             if msg_match:
-                params["new_message"] = msg_match.group(2)
+                params["new_message"] = msg_match.group(2) if len(msg_match.groups()) > 1 else msg_match.group(1)
         
         elif intent_name == "REWORD":
             # Look for target commit
@@ -925,22 +1049,6 @@ class IntentClassifier:
             if "last commit" in normalized_text or "previous commit" in normalized_text or "most recent commit" in normalized_text:
                 params["target"] = "HEAD"
                 
-            # Look for commit message
-            msg_match = re.search(r'(to|with|as)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
-            if not msg_match:
-                msg_match = re.search(r'(message|name|msg|called|with)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
-            if not msg_match:
-                # Try with double quotes
-                msg_match = re.search(r'(message|name|msg|called|with)\s*"([^"]+)"', normalized_text, re.IGNORECASE)
-            if msg_match:
-                params["new_message"] = msg_match.group(2)
-        
-        elif intent_name == "DROP":
-            # Look for target commit hash
-            target_match = re.search(r'(commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
-            if target_match:
-                params["target"] = target_match.group(2)
-            
             # Check for ordinal position references like "second last commit", "third last", etc.
             ordinal_match = re.search(r'(second|third|fourth|fifth|2nd|3rd|4th|5th)\s+(last|previous|recent)\s+commit', normalized_text, re.IGNORECASE)
             if ordinal_match:
@@ -955,105 +1063,26 @@ class IntentClassifier:
                 # For "second last commit", we want HEAD~1, etc.
                 params["target"] = f"HEAD~{ordinal_map.get(ordinal, 1)}"
                 
-            # Check for "last" or "previous" commit (singular)
-            elif "last commit" in normalized_text or "previous commit" in normalized_text or "most recent commit" in normalized_text:
-                params["target"] = "HEAD"
-            
-            # Check for "last N commits" pattern 
-            last_n_match = re.search(r'(last|previous|recent)\s+(\d+)\s+(commit|commits)', normalized_text)
-            if last_n_match:
-                # For multi-commit operations, we need to specify a range
-                count = int(last_n_match.group(2))
-                if count > 1:  # For multiple commits
-                    # When deleting the last N commits, we need the range HEAD~(N-1)..HEAD
-                    params["target"] = f"HEAD~{count-1}..HEAD"
-                else:  # For single commit
-                    params["target"] = "HEAD"
-                    
-            # Direct number pattern - "delete N commits"
-            number_match = re.search(r'(?:delete|remove|drop)\s+(\d+)\s+(?:commit|commits)', normalized_text)
-            if number_match and "target" not in params:
-                count = int(number_match.group(1))
-                if count > 1:
-                    # Same as above, for N commits use HEAD~(N-1)..HEAD
-                    params["target"] = f"HEAD~{count-1}..HEAD"
-                else:
-                    params["target"] = "HEAD"
-                    
-            # Check for numbered commit without context (like "commit 3")
-            commit_num_match = re.search(r'commit\s+(\d+)', normalized_text)
-            if commit_num_match and "target" not in params:
-                commit_num = int(commit_num_match.group(1))
-                # For a specific numbered commit, we want HEAD~(N-1)
-                params["target"] = f"HEAD~{commit_num-1}"
-        
-        elif intent_name == "REORDER":
-            # Look for order specification
-            order_match = re.search(r'order\s*:\s*(.+?)(?:$|\.|;)', normalized_text)
-            if order_match:
-                order_text = order_match.group(1).strip()
-                # Split by commas if present
-                if ',' in order_text:
-                    params["order"] = [s.strip() for s in order_text.split(',')]
-                else:
-                    # Split by spaces
-                    params["order"] = order_text.split()
-            
-            # Look for "swap X and Y" pattern
-            swap_match = re.search(r'swap\s+(.+?)\s+and\s+(.+?)(?:$|\.|;)', normalized_text)
-            if swap_match:
-                params["order"] = [swap_match.group(1), swap_match.group(2)]
-        
-        elif intent_name == "SPLIT":
-            # Look for target commit
-            target_match = re.search(r'(commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
-            if target_match:
-                params["target"] = target_match.group(2)
-                
-            # Check for "last" or "previous" commit
-            if "last commit" in normalized_text or "previous commit" in normalized_text:
-                params["target"] = "HEAD"
-                
-            # Check for split strategy
-            if "by file" in normalized_text or "by files" in normalized_text:
-                params["split_strategy"] = "by_file"
-            elif "manually" in normalized_text or "manual" in normalized_text:
-                params["split_strategy"] = "manual"
-            else:
-                params["split_strategy"] = "default"
-        
-        elif intent_name == "AMEND":
-            # Check for files to add
-            file_match = re.findall(r'(add|with|include)\s+(?:file[s]?\s+)?[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
-            if file_match:
-                params["add_files"] = [match[1] for match in file_match]
-            
-            # Look for stage all
-            if "all changes" in normalized_text or "all files" in normalized_text or "everything" in normalized_text:
-                params["add_files"] = ["--all"]
-                
             # Look for commit message
-            msg_match = re.search(r'(message|name|msg|called|with)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
-            if msg_match:
-                params["new_message"] = msg_match.group(2)
-        
-        elif intent_name == "UNDO":
-            # Look for target (number of commits to undo)
-            number_match = re.search(r'(\d+)(?:\s+commit)', normalized_text)
-            if number_match:
-                params["target"] = number_match.group(1)
+            msg_match = re.search(r'(to|with|as)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
+            if not msg_match:
+                msg_match = re.search(r'(message|name|msg|called|with)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
+            if not msg_match:
+                # Try with double quotes
+                msg_match = re.search(r'(message|name|msg|called|with)\s*"([^"]+)"', normalized_text, re.IGNORECASE)
+            if not msg_match:
+                # Try more general pattern to capture message without specific keywords
+                msg_match = re.search(r'[\'"](.*?)[\'"]', normalized_text)
                 
-            # Check for "last" or "previous" commit
-            if "last commit" in normalized_text or "previous commit" in normalized_text:
-                if "target" not in params:
-                    params["target"] = "HEAD"
-            
-            # Check for specific commit hash
-            target_match = re.search(r'(commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
-            if target_match:
-                params["target"] = target_match.group(2)
+            if msg_match:
+                params["new_message"] = msg_match.group(2) if len(msg_match.groups()) > 1 else msg_match.group(1)
         
         elif intent_name == "RENAME_BRANCH":
+            # First check for current branch name if omitted (common case)
+            if "current" not in params:
+                # Assume current branch when not specified
+                current_branch = None # Could be determined from Git if needed
+            
             # Look for new branch name
             name_match = re.search(r'(?:to|as|name)\s+[\'"]?([a-zA-Z0-9_\-./]+)[\'"]?', normalized_text)
             if name_match:
@@ -1065,11 +1094,21 @@ class IntentClassifier:
                 params["current_name"] = alt_match.group(1)
                 params["new_name"] = alt_match.group(2)
                 
+            # If we still don't have new_name, look for any remaining quoted text
+            if "new_name" not in params:
+                quoted = re.search(r'[\'"](.*?)[\'"]', normalized_text)
+                if quoted:
+                    params["new_name"] = quoted.group(1)
+                    
         elif intent_name == "REBASE_ONTO":
-            # Look for base branch
+            # Look for base branch (the target branch to rebase onto)
             base_match = re.search(r'(?:onto|on|to)\s+[\'"]?([a-zA-Z0-9_\-./]+)[\'"]?', normalized_text)
             if base_match:
                 params["base_branch"] = base_match.group(1)
+            elif "main" in normalized_text:
+                params["base_branch"] = "main"
+            elif "master" in normalized_text:
+                params["base_branch"] = "master"
                 
             # Look for commit range
             range_match = re.search(r'(?:from|since)\s+([a-f0-9]{4,40})', normalized_text)
@@ -1080,6 +1119,21 @@ class IntentClassifier:
             last_n_match = re.search(r'(?:last|recent)\s+(\d+)\s+(?:commit|commits)', normalized_text)
             if last_n_match:
                 params["commit_range"] = f"HEAD~{last_n_match.group(1)}"
+                
+            # If we have no commit range but have base branch, use current branch
+            if "commit_range" not in params and "base_branch" in params:
+                params["commit_range"] = "HEAD"
+        
+        # Add special debug info about the intent
+        if intent_name == "DROP" and "target" not in params:
+            # Look for last N commits pattern again (failsafe)
+            nums = re.findall(r'(\d+)', normalized_text)
+            if len(nums) > 0 and "last" in normalized_text and "commit" in normalized_text:
+                count = int(nums[0])
+                if count > 1:
+                    params["target"] = f"HEAD~{count-1}..HEAD"
+                else:
+                    params["target"] = "HEAD"
         
         # Filter params to only include those in the schema
         if required_params:
@@ -1338,6 +1392,26 @@ if __name__ == "__main__":
                 # Extract and print parameters if available
                 if intent.upper() != "UNKNOWN":
                     params = classifier.extract_intent_parameters(user_input)
+                    
+                    # Double-check DROP intent with last N commits pattern (extra failsafe)
+                    if intent.upper() == "DROP" and "target" not in params:
+                        last_n_match = re.search(r'(last|previous|recent)\s+(\d+)\s+(commit|commits)', normalized)
+                        if last_n_match:
+                            count = int(last_n_match.group(2))
+                            if count > 1:
+                                params["target"] = f"HEAD~{count-1}..HEAD"
+                            else:
+                                params["target"] = "HEAD"
+                        # Try one more pattern
+                        elif re.search(r'(delete|drop|remove)\s+(\d+)', normalized):
+                            nums = re.findall(r'(\d+)', normalized)
+                            if nums:
+                                count = int(nums[0])
+                                if count > 1:
+                                    params["target"] = f"HEAD~{count-1}..HEAD"
+                                else:
+                                    params["target"] = "HEAD"
+                    
                     if params:
                         print("Extracted parameters:")
                         for param, value in params.items():
@@ -1360,3 +1434,4 @@ if __name__ == "__main__":
     except FileNotFoundError as e:
         print(f"Error: {e}")
         print("Make sure to train the model first with: python train.py")
+                        
