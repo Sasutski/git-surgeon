@@ -25,7 +25,11 @@ INTENT_SCHEMAS = {
         "params": ["target", "new_message"]
     },
     Intent.DROP: {
-        "params": ["target"]
+        "params": {
+            "target": {"required": False},
+            "message_match": {"required": False}
+        },
+        "required_one_of": ["target", "message_match"]
     },
     Intent.REORDER: {
         "params": ["order"]

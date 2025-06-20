@@ -761,12 +761,26 @@ class IntentClassifier:
         normalized_text = self._normalize_text(text)
         
         # First check for specific high-priority patterns that need special handling
-        # These are cases where we know with high certainty what the intent is
-        # and we don't want to rely on the ML model which might be confused
         
+        # Check for commit hash references - these are DROP operations
+        hash_match = re.search(r'(?:delete|remove|drop|discard).+(?:commit|sha)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
+        if hash_match or re.search(r'(?:delete|remove|drop|discard).+\b([a-f0-9]{6,40})\b', normalized_text, re.IGNORECASE):
+            # This is definitely a DROP intent
+            results = [("DROP", 0.95)]
+            for i in range(1, min(n, 3)):
+                results.append(("UNKNOWN", 0.1))
+            
+            # Cache and return results
+            self._prediction_cache[f"{text.lower().strip()}:top{n}"] = {
+                'top_predictions': results,
+                'timestamp': time.time()
+            }
+            
+            return results
+            
         # Definite DROP cases: when user clearly says to drop/delete/remove commits with a number
-        drop_pattern = re.search(r'(drop|delet|remov)\s+(?:the\s+)?(last|previous|recent)\s+(\d+)\s+(commit|commits)', normalized_text)
-        if drop_pattern:
+        drop_pattern = re.search(r'(drop|delet|remov|discard)\s+(?:the\s+)?(last|previous|recent)\s+(\d+)?\s*(commit|commits)?', normalized_text)
+        if drop_pattern or re.search(r'(drop|delet|remov|discard).+(commit|commits)', normalized_text):
             # This is definitely a DROP intent with high confidence, don't even bother with the model
             # Do regular prediction but then override the results
             try:
@@ -774,7 +788,7 @@ class IntentClassifier:
                 results = self._get_model_predictions(normalized_text, text, n, is_noise=False)
                 
                 # Now override with DROP at high confidence
-                drop_confidence = 0.95  # Very high confidence
+                drop_confidence = 0.98  # Very high confidence
                 
                 # Find if DROP is already in the results
                 drop_idx = next((i for i, (label, _) in enumerate(results) if label == "DROP"), None)
@@ -907,10 +921,23 @@ class IntentClassifier:
                         # Keep only top N
                         results = results[:n]
             
-            # Cache keys are now handled by the caller
             return results
         except Exception as e:
             raise ValueError(f"Error getting top predictions: {str(e)}")
+
+    def cache_stats(self) -> Dict[str, Any]:
+        """
+        Return statistics about the internal caches.
+        
+        Returns:
+            Dictionary with cache statistics
+        """
+        return {
+            'prediction_cache_size': len(self._prediction_cache),
+            'normalized_text_cache_size': len(self._normalized_text_cache),
+            'max_cache_size': self.MAX_CACHE_SIZE,
+            'cache_expiry_seconds': self.CACHE_EXPIRY_SECONDS
+        }
 
     def extract_intent_parameters(self, text: str) -> Dict[str, Any]:
         """
@@ -936,77 +963,139 @@ class IntentClassifier:
         
         params = {}
         
-        # Get required parameters from schema
-        required_params = INTENT_SCHEMAS.get(intent_enum, {}).get("params", [])
+        # Get parameter schema from intents.py
+        schema = INTENT_SCHEMAS.get(intent_enum, {})
         
+        # Handle different schema formats
+        if isinstance(schema.get("params"), dict):
+            # New format: dictionary of parameters with metadata
+            required_params = [param for param, metadata in schema.get("params", {}).items() 
+                              if metadata.get("required", True)]
+            optional_params = [param for param, metadata in schema.get("params", {}).items() 
+                              if not metadata.get("required", True)]
+            all_params = list(schema.get("params", {}).keys())
+        else:
+            # Old format: simple list of parameters
+            required_params = schema.get("params", [])
+            optional_params = []
+            all_params = required_params
+        
+        # Extract parameters based on intent
         if intent_name == "DROP":
-            # First check for "drop/delete the last X commits" pattern - most common case
-            last_n_match = re.search(r'(?:drop|delet|remov)\s+(?:the\s+)?(?:last|previous|recent)\s+(\d+)\s+(?:commit|commits)', normalized_text, re.IGNORECASE)
+            # Message-based identification - handle first as special case
+            msg_match = re.search(r'(with\s+message|message\s+is|says)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
+            if not msg_match:
+                msg_match = re.search(r'(with\s+message|message\s+is|says)\s*"([^"]+)"', normalized_text, re.IGNORECASE)
+            if not msg_match:
+                # Try to find any quoted text that might be a message
+                msg_match = re.search(r'[\'"](.*?)[\'"]', normalized_text)
+            
+            if msg_match:
+                # Store as message_match parameter rather than embedding in target
+                message = msg_match.group(2) if len(msg_match.groups()) > 1 else msg_match.group(1)
+                params["message_match"] = message
+                # No early return here - we continue parsing to look for target
+                
+            # First handle the "delete the latest commit" case
+            if re.search(r'(delete|remove|drop|discard).+(latest|most\s+recent)', normalized_text, re.IGNORECASE):
+                params["target"] = "HEAD"
+                return params
+                
+            # Handle "delete the last commit"
+            if re.search(r'(delete|remove|drop|discard)\s+(?:the\s+)?(?:last|previous|recent)\s+commit', normalized_text, re.IGNORECASE):
+                params["target"] = "HEAD"
+                return params
+            
+            # Check for "drop/delete the last X commits" pattern - most common case
+            last_n_match = re.search(r'(?:drop|delet|remov|discard)\s+(?:the\s+)?(?:last|previous|recent)\s+(\d+)\s+(?:commit|commits)', normalized_text, re.IGNORECASE)
             if last_n_match:
                 count = int(last_n_match.group(1))
                 if count > 1:
                     params["target"] = f"HEAD~{count-1}..HEAD"
                 else:
                     params["target"] = "HEAD"
+                return params
             
-            # If no match found, check for other patterns...
-            if "target" not in params:
-                # Look for target commit hash
-                target_match = re.search(r'(?:commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
-                if target_match:
-                    params["target"] = target_match.group(1)
+            # Look for commit hash pattern - direct hash reference
+            hash_match = re.search(r'(?:commit|sha|hash|id)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
+            if hash_match:
+                params["target"] = hash_match.group(1)
+                return params
                 
-                # Check for ordinal position references like "second last commit", "third last", etc.
-                ordinal_match = re.search(r'(second|third|fourth|fifth|2nd|3rd|4th|5th)\s+(?:last|previous|recent)\s+commit', normalized_text, re.IGNORECASE)
-                if ordinal_match:
-                    # Map ordinals to their numeric values
-                    ordinal_map = {
-                        'second': 1, '2nd': 1,
-                        'third': 2, '3rd': 2,
-                        'fourth': 3, '4th': 3,
-                        'fifth': 4, '5th': 4
-                    }
-                    ordinal = ordinal_match.group(1).lower()
-                    # For "second last commit", we want HEAD~1, etc.
-                    params["target"] = f"HEAD~{ordinal_map.get(ordinal, 1)}"
-                    
-                # Check for "last" or "previous" commit (singular)
-                elif re.search(r'last\s+commit|previous\s+commit|most\s+recent\s+commit', normalized_text):
+            # Try to find hash without the 'commit' keyword
+            bare_hash_match = re.search(r'\b([a-f0-9]{6,40})\b', normalized_text)
+            if bare_hash_match:
+                params["target"] = bare_hash_match.group(1)
+                return params
+            
+            # Check for "last commit" or similar
+            if re.search(r'last\s+commit|previous\s+commit|recent\s+commit', normalized_text, re.IGNORECASE):
+                params["target"] = "HEAD"
+                return params
+            
+            # Check for ordinal position references like "second last commit", "third last", etc.
+            ordinal_match = re.search(r'(second|third|fourth|fifth|2nd|3rd|4th|5th)\s+(?:last|previous|recent)\s+commit', normalized_text, re.IGNORECASE)
+            if ordinal_match:
+                # Map ordinals to their numeric values
+                ordinal_map = {
+                    'second': 1, '2nd': 1,
+                    'third': 2, '3rd': 2,
+                    'fourth': 3, '4th': 3,
+                    'fifth': 4, '5th': 4
+                }
+                ordinal = ordinal_match.group(1).lower()
+                # For "second last commit", we want HEAD~1, etc.
+                params["target"] = f"HEAD~{ordinal_map.get(ordinal, 1)}"
+                return params
+                
+            # Alternative pattern for "last N commits"
+            last_n_alt = re.search(r'(?:last|previous|recent)\s+(\d+)\s+(?:commit|commits)', normalized_text)
+            if last_n_alt:
+                # For multi-commit operations, we need to specify a range
+                count = int(last_n_alt.group(1))
+                if count > 1:  # For multiple commits
+                    params["target"] = f"HEAD~{count-1}..HEAD"
+                else:  # For single commit
                     params["target"] = "HEAD"
-                
-                # Alternative pattern for "last N commits"
-                last_n_alt = re.search(r'(?:last|previous|recent)\s+(\d+)\s+(?:commit|commits)', normalized_text)
-                if last_n_alt:
-                    # For multi-commit operations, we need to specify a range
-                    count = int(last_n_alt.group(1))
-                    if count > 1:  # For multiple commits
-                        # When deleting the last N commits, we need the range HEAD~(N-1)..HEAD
-                        params["target"] = f"HEAD~{count-1}..HEAD"
-                    else:  # For single commit
-                        params["target"] = "HEAD"
-                        
-                # Direct number pattern - "delete N commits" without "last"
-                number_match = re.search(r'(?:delete|remove|drop)\s+(\d+)\s+(?:commit|commits)', normalized_text)
-                if number_match and "target" not in params:
-                    count = int(number_match.group(1))
-                    if count > 1:
-                        # Same as above, for N commits use HEAD~(N-1)..HEAD
-                        params["target"] = f"HEAD~{count-1}..HEAD"
-                    else:
-                        params["target"] = "HEAD"
-                        
-                # Check for numbered commit without context (like "commit 3")
-                commit_num_match = re.search(r'commit\s+(\d+)', normalized_text)
-                if commit_num_match and "target" not in params:
-                    commit_num = int(commit_num_match.group(1))
-                    # For a specific numbered commit, we want HEAD~(N-1)
-                    params["target"] = f"HEAD~{commit_num-1}"
+                return params
                     
-                # Handle "delete from X to Y" pattern
-                range_match = re.search(r'from\s+(\S+)\s+to\s+(\S+)', normalized_text)
-                if range_match:
-                    params["target"] = f"{range_match.group(1)}..{range_match.group(2)}"
-        
+            # Direct number pattern - "delete N commits" without "last"
+            number_match = re.search(r'(?:delete|remove|drop|discard)\s+(\d+)\s+(?:commit|commits)', normalized_text)
+            if number_match and "target" not in params:
+                count = int(number_match.group(1))
+                if count > 1:
+                    params["target"] = f"HEAD~{count-1}..HEAD"
+                else:
+                    params["target"] = "HEAD"
+                return params
+                    
+            # Check for numbered commit without context (like "commit 3")
+            commit_num_match = re.search(r'commit\s+(\d+)', normalized_text)
+            if commit_num_match and "target" not in params:
+                commit_num = int(commit_num_match.group(1))
+                # For a specific numbered commit, we want HEAD~(N-1)
+                params["target"] = f"HEAD~{commit_num-1}"
+                return params
+                
+            # Handle "delete from X to Y" pattern
+            range_match = re.search(r'from\s+(\S+)\s+to\s+(\S+)', normalized_text)
+            if range_match:
+                params["target"] = f"{range_match.group(1)}..{range_match.group(2)}"
+                return params
+                
+            # If we've exhausted all specific patterns and still have nothing,
+            # check if the text clearly indicates deleting a commit
+            if "message_match" not in params and re.search(r'(delete|remove|drop|discard).+commit', normalized_text, re.IGNORECASE):
+                # Default to HEAD when the intent is clear but target is ambiguous
+                params["target"] = "HEAD"
+                return params
+            
+            # If we have a message_match but no target, set a default target
+            # This allows the executor to decide how to handle message matching
+            if "message_match" in params and "target" not in params:
+                # Search in a larger history window (last 50 commits)
+                params["target"] = "HEAD~50..HEAD"
+
         elif intent_name == "SQUASH":
             # Look for number of commits to squash
             number_match = re.search(r'(\d+)(?:\s+commit)', normalized_text)
@@ -1077,6 +1166,82 @@ class IntentClassifier:
             if msg_match:
                 params["new_message"] = msg_match.group(2) if len(msg_match.groups()) > 1 else msg_match.group(1)
         
+        elif intent_name == "REORDER":
+            # Look for order specification
+            order_match = re.search(r'order\s*:\s*(.+?)(?:$|\.|;)', normalized_text)
+            if order_match:
+                order_text = order_match.group(1).strip()
+                # Split by commas if present
+                if ',' in order_text:
+                    params["order"] = [s.strip() for s in order_text.split(',')]
+                else:
+                    # Split by spaces
+                    params["order"] = order_text.split()
+            
+            # Look for "swap X and Y" pattern
+            swap_match = re.search(r'swap\s+(.+?)\s+and\s+(.+?)(?:$|\.|;)', normalized_text)
+            if swap_match:
+                params["order"] = [swap_match.group(1), swap_match.group(2)]
+                
+            # If we still don't have order, try to derive from the context
+            if "order" not in params:
+                # Check for numeric patterns like "reorder commits 1, 2, 3" or "change order to 3, 1, 2"
+                nums = re.findall(r'(\d+)', normalized_text)
+                if nums:
+                    params["order"] = nums
+                # Look for commit references
+                elif "last" in normalized_text or "head" in normalized_text:
+                    params["order"] = ["HEAD~2", "HEAD~1", "HEAD"]
+
+        elif intent_name == "SPLIT":
+            # Look for target commit
+            target_match = re.search(r'(commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
+            if target_match:
+                params["target"] = target_match.group(2)
+                
+            # Check for "last" or "previous" commit
+            if "last commit" in normalized_text or "previous commit" in normalized_text:
+                params["target"] = "HEAD"
+                
+            # Check for split strategy
+            if "by file" in normalized_text or "by files" in normalized_text:
+                params["split_strategy"] = "by_file"
+            elif "manually" in normalized_text or "manual" in normalized_text:
+                params["split_strategy"] = "manual"
+            else:
+                params["split_strategy"] = "default"
+        
+        elif intent_name == "AMEND":
+            # Check for files to add
+            file_match = re.findall(r'(add|with|include)\s+(?:file[s]?\s+)?[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
+            if file_match:
+                params["add_files"] = [match[1] for match in file_match]
+            
+            # Look for stage all
+            if "all changes" in normalized_text or "all files" in normalized_text or "everything" in normalized_text:
+                params["add_files"] = ["--all"]
+                
+            # Look for commit message
+            msg_match = re.search(r'(message|name|msg|called|with)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
+            if msg_match:
+                params["new_message"] = msg_match.group(2)
+        
+        elif intent_name == "UNDO":
+            # Look for target (number of commits to undo)
+            number_match = re.search(r'(\d+)(?:\s+commit)', normalized_text)
+            if number_match:
+                params["target"] = number_match.group(1)
+                
+            # Check for "last" or "previous" commit
+            if "last commit" in normalized_text or "previous commit" in normalized_text:
+                if "target" not in params:
+                    params["target"] = "HEAD"
+            
+            # Check for specific commit hash
+            target_match = re.search(r'(commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
+            if target_match:
+                params["target"] = target_match.group(2)
+        
         elif intent_name == "RENAME_BRANCH":
             # First check for current branch name if omitted (common case)
             if "current" not in params:
@@ -1136,11 +1301,10 @@ class IntentClassifier:
                     params["target"] = "HEAD"
         
         # Filter params to only include those in the schema
-        if required_params:
-            params = {k: v for k, v in params.items() if k in required_params}
+        if all_params:
+            params = {k: v for k, v in params.items() if k in all_params}
             
         return params
-
 
     def _is_likely_noise(self, text: str) -> bool:
         """
@@ -1393,24 +1557,28 @@ if __name__ == "__main__":
                 if intent.upper() != "UNKNOWN":
                     params = classifier.extract_intent_parameters(user_input)
                     
-                    # Double-check DROP intent with last N commits pattern (extra failsafe)
-                    if intent.upper() == "DROP" and "target" not in params:
-                        last_n_match = re.search(r'(last|previous|recent)\s+(\d+)\s+(commit|commits)', normalized)
-                        if last_n_match:
-                            count = int(last_n_match.group(2))
-                            if count > 1:
-                                params["target"] = f"HEAD~{count-1}..HEAD"
-                            else:
-                                params["target"] = "HEAD"
-                        # Try one more pattern
-                        elif re.search(r'(delete|drop|remove)\s+(\d+)', normalized):
-                            nums = re.findall(r'(\d+)', normalized)
-                            if nums:
-                                count = int(nums[0])
-                                if count > 1:
-                                    params["target"] = f"HEAD~{count-1}..HEAD"
-                                else:
-                                    params["target"] = "HEAD"
+                    # Double-check DROP intent with special patterns (extra failsafe)
+                    if intent.upper() == "DROP" and "target" not in params and "message_match" not in params:
+                        # Get schema
+                        schema = INTENT_SCHEMAS.get(intent_enum, {})
+                        required_one_of = schema.get("required_one_of", [])
+                        
+                        # Latest commit cases
+                        if "latest" in normalized or "recent" in normalized:
+                            params["target"] = "HEAD"
+                            
+                        # Message-based targets - now use message_match parameter
+                        msg_match = re.search(r'[\'"](.*?)[\'"]', normalized)
+                        if msg_match and "message_match" not in params:
+                            params["message_match"] = msg_match.group(1)
+                            # Use a larger history window for message matching
+                            if "target" not in params:
+                                params["target"] = "HEAD~50..HEAD"
+                        
+                        # Hash-based targets
+                        hash_match = re.search(r'\b([a-f0-9]{6,40})\b', normalized)
+                        if hash_match:
+                            params["target"] = hash_match.group(1)
                     
                     if params:
                         print("Extracted parameters:")
@@ -1419,14 +1587,43 @@ if __name__ == "__main__":
                     
                     # Show missing required parameters based on schema
                     try:
-                        required_params = INTENT_SCHEMAS.get(intent_enum, {}).get("params", [])
+                        schema = INTENT_SCHEMAS.get(intent_enum, {})
+                        
+                        # Handle both old and new schema formats
+                        if isinstance(schema.get("params"), dict):
+                            # New format with dictionary of params
+                            required_params = [param for param, metadata in schema.get("params", {}).items() 
+                                             if metadata.get("required", True)]
+                            
+                            # Check for required_one_of constraint
+                            required_one_of = schema.get("required_one_of", [])
+                            if required_one_of:
+                                # Only check for missing if none of the required_one_of params are present
+                                if not any(param in params for param in required_one_of):
+                                    print("Missing parameters - requires at least one of these:")
+                                    for param in required_one_of:
+                                        if param not in params:
+                                            print(f"  - {param}")
+                            
+                            # Don't show individual missing parameters that are part of required_one_of
+                            # if at least one of the required_one_of params is present
+                            if required_one_of and any(param in params for param in required_one_of):
+                                # Filter out required_one_of params from the missing check
+                                required_params = [p for p in required_params if p not in required_one_of]
+                        else:
+                            # Old format with list of params
+                            required_params = schema.get("params", [])
+                        
+                        # Show any absolutely required params that are missing
                         missing_params = [param for param in required_params if param not in params]
                         if missing_params:
-                            print("Missing parameters that may be required:")
+                            print("Missing required parameters:")
                             for param in missing_params:
                                 print(f"  - {param}")
-                    except Exception:
-                        pass
+                                
+                    except Exception as e:
+                        # Don't crash on schema parsing errors
+                        print(f"Error checking parameter requirements: {e}")
                     
             except Exception as e:
                 print(f"Error classifying intent: {e}")
