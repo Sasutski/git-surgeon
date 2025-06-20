@@ -1,4 +1,4 @@
-# Git Surgeon
+# Git Surgeon ![Hackatime](https://hackatime-badge.hackclub.com/U071XKM2UDC/git-surgeon)
 
 **Git Surgeon** is an AI-assisted command-line tool that allows developers to rewrite and clean up Git commit history using natural language.
 

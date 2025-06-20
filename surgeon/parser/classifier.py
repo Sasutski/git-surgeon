@@ -94,7 +94,7 @@ class IntentClassifier:
     ACTION_INTENT_MAP = {
         # Strong DROP indicators
         'delete': 'DROP',
-        'remove': 'DROP', 
+        'remove': 'DROP',
         'eliminate': 'DROP',
         'discard': 'DROP',
         'drop': 'DROP',
@@ -1434,4 +1434,3 @@ if __name__ == "__main__":
     except FileNotFoundError as e:
         print(f"Error: {e}")
         print("Make sure to train the model first with: python train.py")
-                        
