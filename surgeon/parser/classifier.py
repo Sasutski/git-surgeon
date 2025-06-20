@@ -442,7 +442,7 @@ class IntentClassifier:
     def _detect_primary_action(self, text: str) -> Tuple[str, float]:
         """
         Detect the primary action in the text to help disambiguate between similar intents.
-        This serves as an additional signal beyond the ML model's prediction.
+        This serves as an additional signal beyond the ML model's prediction
         
         Args:
             text: Input text
@@ -452,6 +452,15 @@ class IntentClassifier:
         """
         text_lower = text.lower()
         
+        # Check for REORDER-specific patterns first - strengthen the pattern and boost
+        if re.search(r'(switch|swap|exchang|revers|flip).+(position|order|place|commit)', text_lower):
+            return 'REORDER', 0.75  # Much stronger confidence boost for explicit reordering operations
+        
+        # Check for commit hash pattern which strongly indicates REORDER
+        hash_pattern = re.findall(r'\b([a-f0-9]{4,40})\b', text_lower)
+        if len(hash_pattern) >= 2 and ('switch' in text_lower or 'swap' in text_lower or 'reorder' in text_lower):
+            return 'REORDER', 0.8  # Very high confidence for hash-based reordering
+    
         # Check for direct action matches
         for pattern, intent in self.action_patterns.items():
             if pattern.search(text_lower):
@@ -1177,8 +1186,55 @@ class IntentClassifier:
                 
             if msg_match:
                 params["new_message"] = msg_match.group(2) if len(msg_match.groups()) > 1 else msg_match.group(1)
-        
+                
+            # Default to HEAD when no target is explicitly provided
+            if "target" not in params:
+                params["target"] = "HEAD"
+
         elif intent_name == "REORDER":
+            # Handle "reorder the last N commits" pattern - this needs special handling
+            last_n_commits = re.search(r'(?:reorder|switch|reverse|flip)\s+(?:the\s+)?(?:last|previous|recent)\s+(\d+)\s+(?:commit|commits)', normalized_text, re.IGNORECASE)
+            if last_n_commits:
+                count = int(last_n_commits.group(1))
+                if count > 1:
+                    # Instead of assuming "reverse" order, just set the target range
+                    # and let the executor handle the ordering interactively
+                    # Don't set an explicit "order" parameter for this case
+                    params["target"] = f"HEAD~{count-1}..HEAD"
+                    return params
+    
+            # Only set "order: reverse" for explicit reverse/flip commands
+            reverse_pattern = re.search(r'(?:reverse|flip|backwards|opposite)\s+(?:the\s+)?(?:order\s+(?:of\s+)?)?', normalized_text, re.IGNORECASE)
+            if reverse_pattern and "last" in normalized_text:
+                # Extract the count if available
+                count_match = re.search(r'(?:last|previous|recent)\s+(\d+)', normalized_text)
+                count = int(count_match.group(1)) if count_match else 2
+                
+                # Now set both parameters
+                params["order"] = "reverse" 
+                params["target"] = f"HEAD~{count-1}..HEAD"
+                return params
+                
+            # Look for specific commit hashes to switch
+            hash_swap_match = re.search(r'(?:switch|swap|exchang|revers|flip).+(?:position|order|place).+(?:of\s+)?(?:commit|hash)?\s*[\'"]?([a-f0-9]{4,40})[\'"]?\s+(?:and|with)\s+[\'"]?([a-f0-9]{4,40})[\'"]?', normalized_text, re.IGNORECASE)
+            if not hash_swap_match:
+                # Try simpler pattern without surrounding text
+                hash_swap_match = re.search(r'(?:commit|hash)?\s*[\'"]?([a-f0-9]{4,40})[\'"]?\s+(?:and|with)\s+[\'"]?([a-f0-9]{4,40})[\'"]?', normalized_text, re.IGNORECASE)
+        
+            if hash_swap_match:
+                # Get the two commit hashes to swap
+                first_hash = hash_swap_match.group(1)
+                second_hash = hash_swap_match.group(2)
+                params["order"] = [second_hash, first_hash]
+                return params
+            
+            # Alternate pattern for swapping two hashes without "and" or "with"
+            hash_direct_match = re.findall(r'\b([a-f0-9]{4,40})\b', normalized_text)
+            if len(hash_direct_match) >= 2 and any(word in normalized_text for word in ['switch', 'swap', 'reorder', 'exchange', 'position']):
+                # Extract the first two hashes in reverse order (since we're swapping them)
+                params["order"] = [hash_direct_match[1], hash_direct_match[0]]
+                return params
+            
             # Look for order specification
             order_match = re.search(r'order\s*:\s*(.+?)(?:$|\.|;)', normalized_text)
             if order_match:
@@ -1195,112 +1251,53 @@ class IntentClassifier:
             if swap_match:
                 params["order"] = [swap_match.group(1), swap_match.group(2)]
                 
+            # Look for "reverse" pattern - this is a special case
+            reverse_match = re.search(r'reverse\s+(?:the\s+)?(?:order\s+(?:of\s+)?)?(?:the\s+)?(?:last|previous|recent)?\s*(\d+)?\s*(?:commit|commits)?', normalized_text, re.IGNORECASE)
+            if reverse_match:
+                count = int(reverse_match.group(1)) if reverse_match.group(1) else 2
+                # For a reverse operation, we specify "reverse" as the order and provide a target range
+                params["order"] = "reverse"
+                params["target"] = f"HEAD~{count-1}..HEAD"
+                return params
+                
             # If we still don't have order, try to derive from the context
             if "order" not in params:
                 # Check for numeric patterns like "reorder commits 1, 2, 3" or "change order to 3, 1, 2"
                 nums = re.findall(r'(\d+)', normalized_text)
                 if nums:
-                    params["order"] = nums
+                    if "reverse" in normalized_text or "backwards" in normalized_text or "opposite" in normalized_text:
+                        # Handle reverse ordering case
+                        if len(nums) == 1:
+                            # If only one number, it's the count of commits to reverse
+                            count = int(nums[0])
+                            params["order"] = "reverse"
+                            params["target"] = f"HEAD~{count-1}..HEAD"
+                        else:
+                            # If multiple numbers, they represent the desired order
+                            params["order"] = nums
+                    else:
+                        params["order"] = nums
                 # Look for commit references
                 elif "last" in normalized_text or "head" in normalized_text:
-                    params["order"] = ["HEAD~2", "HEAD~1", "HEAD"]
+                    # Check if it's a reverse request
+                    if "reverse" in normalized_text or "backwards" in normalized_text or "opposite" in normalized_text:
+                        # Default to reversing 2 commits if not specified
+                        params["order"] = "reverse"
+                        params["target"] = "HEAD~2..HEAD"
+                    else:
+                        # Try to get the number of commits to reorder
+                        num_match = re.search(r'(?:last|recent)\s+(\d+)', normalized_text)
+                        if num_match:
+                            count = int(num_match.group(1))
+                            if count > 2:  # For reordering multiple commits
+                                params["order"] = "reverse"
+                                params["target"] = f"HEAD~{count-1}..HEAD"
+                            else:  # Default for 2 or fewer
+                                params["order"] = ["HEAD~2", "HEAD~1", "HEAD"]
+                        else:
+                            # Default if no number specified
+                            params["order"] = ["HEAD~2", "HEAD~1", "HEAD"]
 
-        elif intent_name == "SPLIT":
-            # Look for target commit
-            target_match = re.search(r'(commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
-            if target_match:
-                params["target"] = target_match.group(2)
-                
-            # Check for "last" or "previous" commit
-            if "last commit" in normalized_text or "previous commit" in normalized_text:
-                params["target"] = "HEAD"
-                
-            # Check for split strategy
-            if "by file" in normalized_text or "by files" in normalized_text:
-                params["split_strategy"] = "by_file"
-            elif "manually" in normalized_text or "manual" in normalized_text:
-                params["split_strategy"] = "manual"
-            else:
-                params["split_strategy"] = "default"
-        
-        elif intent_name == "AMEND":
-            # Check for files to add
-            file_match = re.findall(r'(add|with|include)\s+(?:file[s]?\s+)?[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
-            if file_match:
-                params["add_files"] = [match[1] for match in file_match]
-            
-            # Look for stage all
-            if "all changes" in normalized_text or "all files" in normalized_text or "everything" in normalized_text:
-                params["add_files"] = ["--all"]
-                
-            # Look for commit message
-            msg_match = re.search(r'(message|name|msg|called|with)\s*[\'"]([^\'"]+)[\'"]', normalized_text, re.IGNORECASE)
-            if msg_match:
-                params["new_message"] = msg_match.group(2)
-        
-        elif intent_name == "UNDO":
-            # Look for target (number of commits to undo)
-            number_match = re.search(r'(\d+)(?:\s+commit)', normalized_text)
-            if number_match:
-                params["target"] = number_match.group(1)
-                
-            # Check for "last" or "previous" commit
-            if "last commit" in normalized_text or "previous commit" in normalized_text:
-                if "target" not in params:
-                    params["target"] = "HEAD"
-            
-            # Check for specific commit hash
-            target_match = re.search(r'(commit)\s+([a-f0-9]{4,40})', normalized_text, re.IGNORECASE)
-            if target_match:
-                params["target"] = target_match.group(2)
-        
-        elif intent_name == "RENAME_BRANCH":
-            # First check for current branch name if omitted (common case)
-            if "current" not in params:
-                # Assume current branch when not specified
-                current_branch = None # Could be determined from Git if needed
-            
-            # Look for new branch name
-            name_match = re.search(r'(?:to|as|name)\s+[\'"]?([a-zA-Z0-9_\-./]+)[\'"]?', normalized_text)
-            if name_match:
-                params["new_name"] = name_match.group(1)
-                
-            # Alternative pattern: "rename branch X to Y"
-            alt_match = re.search(r'(?:rename|change)\s+branch\s+[\'"]?([a-zA-Z0-9_\-./]+)[\'"]?\s+to\s+[\'"]?([a-zA-Z0-9_\-./]+)[\'"]?', normalized_text)
-            if alt_match:
-                params["current_name"] = alt_match.group(1)
-                params["new_name"] = alt_match.group(2)
-                
-            # If we still don't have new_name, look for any remaining quoted text
-            if "new_name" not in params:
-                quoted = re.search(r'[\'"](.*?)[\'"]', normalized_text)
-                if quoted:
-                    params["new_name"] = quoted.group(1)
-                    
-        elif intent_name == "REBASE_ONTO":
-            # Look for base branch (the target branch to rebase onto)
-            base_match = re.search(r'(?:onto|on|to)\s+[\'"]?([a-zA-Z0-9_\-./]+)[\'"]?', normalized_text)
-            if base_match:
-                params["base_branch"] = base_match.group(1)
-            elif "main" in normalized_text:
-                params["base_branch"] = "main"
-            elif "master" in normalized_text:
-                params["base_branch"] = "master"
-                
-            # Look for commit range
-            range_match = re.search(r'(?:from|since)\s+([a-f0-9]{4,40})', normalized_text)
-            if range_match:
-                params["commit_range"] = range_match.group(1)
-                
-            # Look for "last N commits" pattern
-            last_n_match = re.search(r'(?:last|recent)\s+(\d+)\s+(?:commit|commits)', normalized_text)
-            if last_n_match:
-                params["commit_range"] = f"HEAD~{last_n_match.group(1)}"
-                
-            # If we have no commit range but have base branch, use current branch
-            if "commit_range" not in params and "base_branch" in params:
-                params["commit_range"] = "HEAD"
-        
         # Add special debug info about the intent
         if intent_name == "DROP" and "target" not in params:
             # Look for last N commits pattern again (failsafe)
@@ -1533,6 +1530,31 @@ if __name__ == "__main__":
                     if corrections:
                         print(f"Corrected: {', '.join(corrections)}")
                 
+                # Before making ML predictions, check for special cases
+                # Special case for commit hash patterns in REORDER
+                hash_pattern = re.findall(r'\b([a-f0-9]{4,40})\b', user_input.lower())
+                reorder_words = ['switch', 'swap', 'reorder', 'exchange', 'position']
+                
+                if len(hash_pattern) >= 2 and any(word in user_input.lower() for word in reorder_words):
+                    # Override predictions, this is definitely a REORDER intent
+                    intent = "REORDER"
+                    intent_enum = Intent.REORDER
+                    confidence = 0.95
+                    
+                    # Extract parameters directly
+                    params = {
+                        "order": [hash_pattern[1], hash_pattern[0]]  # Swap the first two hashes found
+                    }
+                    
+                    print(f"Intent: {intent_enum.name} ({confidence:.1%} confident)")
+                    print("Extracted parameters:")
+                    for param, value in params.items():
+                        print(f"  - {param}: {value}")
+                    
+                    # Skip the rest of the loop for this special case
+                    continue
+                    
+                # Standard ML predictions continue here
                 # Get top 3 predictions with confidence
                 top_predictions = classifier.get_top_n_predictions(user_input, 3)
                 intent, confidence = top_predictions[0]
@@ -1571,18 +1593,18 @@ if __name__ == "__main__":
                     
                     # Ensure we don't have incorrect parameters
                     # Filter parameters based on the intent schema
-                    schema = INTENT_SCHEMAS.get(intent_enum, {})
-                    allowed_params = []
+                    # ...existing code...
                     
-                    if isinstance(schema.get("params"), dict):
-                        # New schema format
-                        allowed_params = list(schema.get("params", {}).keys())
-                    else:
-                        # Old schema format
-                        allowed_params = schema.get("params", [])
-                    
-                    # Filter out any parameters not in the schema
-                    params = {k: v for k, v in params.items() if k in allowed_params}
+                    # Special handling for REWORD to ensure 'target' parameter is present
+                    if intent.upper() == "REWORD" and "target" not in params:
+                        params["target"] = "HEAD"
+                        
+                    # Special handling for REORDER with "reverse" order
+                    # If the order parameter is "reverse", it's a valid value and not missing
+                    if intent.upper() == "REORDER" and "order" in params and params["order"] == "reverse":
+                        # This is a special case where the order is a string value, not an array
+                        # The parameter is present and valid, no need to show it as missing
+                        pass
                     
                     # Double-check DROP intent with special patterns (extra failsafe)
                     if intent.upper() == "DROP" and "target" not in params and "message_match" not in params:
@@ -1643,6 +1665,11 @@ if __name__ == "__main__":
                         
                         # Show any absolutely required params that are missing
                         missing_params = [param for param in required_params if param not in params]
+                        
+                        # Special case for REORDER intent - "order" might be string "reverse" which is valid
+                        if intent.upper() == "REORDER" and "order" in missing_params and "order" in params:
+                            missing_params.remove("order")
+                        
                         if missing_params:
                             print("Missing required parameters:")
                             for param in missing_params:

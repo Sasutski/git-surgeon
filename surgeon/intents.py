@@ -22,7 +22,10 @@ INTENT_SCHEMAS = {
         "params": ["count", "new_message"]
     },
     Intent.REWORD: {
-        "params": ["target", "new_message"]
+        "params": {
+            "target": {"required": False},
+            "new_message": {"required": True}
+        }
     },
     Intent.DROP: {
         "params": {
@@ -32,7 +35,10 @@ INTENT_SCHEMAS = {
         "required_one_of": ["target", "message_match"]
     },
     Intent.REORDER: {
-        "params": ["order"]
+        "params": {
+            "order": {"required": True},
+            "target": {"required": False}
+        }
     },
     Intent.SPLIT: {
         "params": ["target", "split_strategy"]
